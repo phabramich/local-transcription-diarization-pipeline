@@ -1,0 +1,27 @@
+{
+  "host": "127.0.0.1",
+  "port": 8091,
+  "backend": "vulkan",
+  "device": 1,
+  "threads": 8,
+  "lazy_load": false,
+  "max_loaded_models": 2,
+  "min_free_memory_mb": 512,
+  "busy_timeout_ms": 120000,
+  "models": [
+    {
+      "id": "sortformer",
+      "family": "sortformer_diar_v2",
+      "path": "models/sortformer-v2.1-f16-mixed.gguf",
+      "task": "diar",
+      "mode": "streaming"
+    },
+    {
+      "id": "parakeet",
+      "family": "parakeet_tdt",
+      "path": "models/parakeet-tdt-0.6b-v3-q8_0.gguf",
+      "task": "asr",
+      "mode": "streaming"
+    }
+  ]
+}
