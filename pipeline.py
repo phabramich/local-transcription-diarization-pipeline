@@ -189,21 +189,12 @@ def embed_seg(extractor, samples, s: int, e: int):
 
 
 def assign_speakers(samples, words: list[dict], turns: list[dict], extractor,
-                    min_seg_s: float = 0.5, min_sim: float = 0.30, min_margin: float = 0.02) -> list[dict]:
+                    min_seg_s: float = 0.5, min_sim: float = 0.30, min_margin: float = 0.02,
+                    merge_sim: float = 0.45) -> list[dict]:
     """Re-attribute probe segments via CAM++ embeddings against sortformer speaker centroids."""
     import numpy as np
 
-    segs = probe_segments(words, turns)
-    # centroids: weighted mean of embeddings over each speaker's confident turns
-    by_spk: dict[str, list] = {}
-    for t in turns:
-        if t["end_sample"] - t["start_sample"] >= int(0.6 * SR):
-            e = embed_seg(extractor, samples, t["start_sample"], t["end_sample"])
-            if e is not None:
-                w = (t["end_sample"] - t["start_sample"]) * max(t.get("confidence", 1.0), 0.1)
-                by_spk.setdefault(t["speaker_id"], []).append((e, w))
-    centroids = {}
-    for spk, lst in by_spk.items():
+    def centroid(lst):
         embs = np.stack([e for e, _ in lst])
         wgt = np.array([w for _, w in lst])
         m = np.average(embs, axis=0, weights=wgt)
@@ -215,25 +206,118 @@ def assign_speakers(samples, words: list[dict], turns: list[dict], extractor,
             if keep.sum() >= 2:
                 m = np.average(embs[keep], axis=0, weights=wgt[keep])
                 m /= np.linalg.norm(m)
-        centroids[spk] = m
+        return m
+
+    segs = probe_segments(words, turns)
+    # centroids: weighted mean of embeddings over each speaker's confident turns
+    by_spk: dict[str, list] = {}
+    for t in turns:
+        if t["end_sample"] - t["start_sample"] >= int(0.6 * SR):
+            e = embed_seg(extractor, samples, t["start_sample"], t["end_sample"])
+            if e is not None:
+                w = (t["end_sample"] - t["start_sample"]) * max(t.get("confidence", 1.0), 0.1)
+                by_spk.setdefault(t["speaker_id"], []).append((e, w))
+    centroids = {spk: centroid(lst) for spk, lst in by_spk.items()}
+
+    # merge clusters whose centroids are nearly identical — sortformer sometimes
+    # splits one voice into two ids on clean fragments
+    root = {s: s for s in centroids}
+    def find(x):
+        while root[x] != x:
+            root[x] = root[root[x]]
+            x = root[x]
+        return x
+    def canon(s):
+        return find(s) if s in root else s
+    spks = list(centroids)
+    for i, a in enumerate(spks):
+        for b in spks[i + 1:]:
+            if float(centroids[a] @ centroids[b]) >= merge_sim:
+                root[find(b)] = find(a)
+    if len({find(s) for s in spks}) < len(spks):
+        pooled: dict[str, list] = {}
+        for spk, lst in by_spk.items():
+            pooled.setdefault(find(spk), []).extend(lst)
+        centroids = {spk: centroid(lst) for spk, lst in pooled.items()}
 
     for s in segs:
         dur = s["end_sample"] - s["start_sample"]
         s["turn_spk"] = speaker_of(s["words"][0], turns)
         if dur < int(min_seg_s * SR) or len(centroids) < 2:
-            s["speaker"] = s["turn_spk"]
+            s["speaker"] = canon(s["turn_spk"])
             continue
         e = embed_seg(extractor, samples, s["start_sample"], s["end_sample"])
         if e is None:
-            s["speaker"] = s["turn_spk"]
+            s["speaker"] = canon(s["turn_spk"])
             continue
         sims = sorted(((float(e @ c), spk) for spk, c in centroids.items()), reverse=True)
         s["sims"] = {spk: round(v, 3) for v, spk in sims}
         if sims[0][0] >= min_sim and sims[0][0] - sims[1][0] >= min_margin:
             s["speaker"] = sims[0][1]
         else:
-            s["speaker"] = s["turn_spk"]
+            s["speaker"] = canon(s["turn_spk"])
+    segs = split_mixed_segs(samples, segs, centroids, extractor)
     return refine_edges(samples, segs, centroids, extractor)
+
+
+def split_mixed_segs(samples, segs: list[dict], centroids: dict, extractor,
+                     min_seg_s: float = 2.5, win_s: float = 1.1,
+                     min_sim: float = 0.30, min_margin: float = 0.04,
+                     min_run_s: float = 0.75) -> list[dict]:
+    """Intra-segment pass: a probe segment can hide a speaker change sortformer
+    missed (no turn boundary, no >gap pause). Embed a ~win_s window anchored at
+    each word; a run of windows matching a different speaker splits the segment."""
+    import numpy as np
+    if len(centroids) < 2:
+        return segs
+    spks = list(centroids)
+    C = np.stack([centroids[k] for k in spks])
+    win = int(win_s * SR)
+    out: list[dict] = []
+    for s in segs:
+        if s["end_sample"] - s["start_sample"] < int(min_seg_s * SR):
+            out.append(s)
+            continue
+        labels = []
+        for w in s["words"]:
+            ws = w["start_sample"]
+            we = min(ws + win, s["end_sample"])
+            if we - ws < int(0.5 * SR):
+                ws = max(s["start_sample"], we - win)
+            e = embed_seg(extractor, samples, ws, we)
+            lab = s["speaker"]
+            if e is not None:
+                sims = C @ e
+                order = np.argsort(sims)[::-1]
+                if sims[order[0]] >= min_sim and sims[order[0]] - sims[order[1]] >= min_margin:
+                    lab = spks[order[0]]
+            labels.append(lab)
+        for i in range(1, len(labels) - 1):
+            if labels[i] != labels[i - 1] and labels[i - 1] == labels[i + 1]:
+                labels[i] = labels[i - 1]
+        groups: list[dict] = []
+        for w, lab in zip(s["words"], labels):
+            if groups and groups[-1]["speaker"] == lab:
+                groups[-1]["words"].append(w)
+            else:
+                groups.append({"speaker": lab, "words": [w]})
+        for g in groups:
+            dur = g["words"][-1]["end_sample"] - g["words"][0]["start_sample"]
+            confident = (len(g["words"]) >= 2 and dur >= int(min_run_s * SR)) or dur >= int(1.4 * SR)
+            if g["speaker"] != s["speaker"] and not confident:
+                g["speaker"] = s["speaker"]
+        for g in groups:
+            if out and out[-1].get("_parent") is s and out[-1]["speaker"] == g["speaker"]:
+                out[-1]["words"].extend(g["words"])
+                out[-1]["end_sample"] = g["words"][-1]["end_sample"]
+                continue
+            out.append({"speaker": g["speaker"], "turn_spk": s.get("turn_spk"), "_parent": s,
+                        "src": "intra",
+                        "start_sample": g["words"][0]["start_sample"],
+                        "end_sample": g["words"][-1]["end_sample"], "words": g["words"]})
+    for s in out:
+        s.pop("_parent", None)
+    return out
 
 
 def refine_edges(samples, segs: list[dict], centroids: dict, extractor,
@@ -252,6 +336,9 @@ def refine_edges(samples, segs: list[dict], centroids: dict, extractor,
         for w in s["words"]:
             w["spk"] = s["speaker"]
             w["_seg"] = s
+            w["_tspk"] = s.get("turn_spk")
+            w["_sims"] = s.get("sims")
+            w["_src"] = s.get("src")
 
     for i in range(len(flat) - 1):
         a_spk, b_spk = flat[i]["spk"], flat[i + 1]["spk"]
@@ -278,15 +365,15 @@ def refine_edges(samples, segs: list[dict], centroids: dict, extractor,
                 w["spk"] = new
                 w["spk_src"] = "emb"
 
-    for w in flat:
-        w.pop("_seg", None)
     out: list[dict] = []
     for w in flat:
+        w.pop("_seg", None)
+        tspk, sims, src = w.pop("_tspk", None), w.pop("_sims", None), w.pop("_src", None)
         if out and out[-1]["speaker"] == w["spk"] and w["start_sample"] - out[-1]["end_sample"] <= int(0.4 * SR):
             out[-1]["words"].append(w)
             out[-1]["end_sample"] = w["end_sample"]
         else:
-            out.append({"speaker": w["spk"], "turn_spk": w["spk"],
+            out.append({"speaker": w["spk"], "turn_spk": tspk, "sims": sims, "src": src,
                         "start_sample": w["start_sample"], "end_sample": w["end_sample"], "words": [w]})
     return out
 
@@ -367,6 +454,7 @@ def main() -> None:
     print(f"spk-embed: {len(segs)} segments, {t_spk:.1f}s")
     (work / "segments.json").write_text(json.dumps(
         [{"speaker": s["speaker"], "turn_spk": s.get("turn_spk"), "sims": s.get("sims"),
+          "src": s.get("src"),
           "start_s": s["start_sample"] / SR, "end_s": s["end_sample"] / SR,
           "text": " ".join(w["word"] for w in s["words"])} for s in segs],
         ensure_ascii=False, indent=1), encoding="utf-8")
