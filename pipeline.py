@@ -220,7 +220,9 @@ def assign_speakers(samples, words: list[dict], turns: list[dict], extractor,
     centroids = {spk: centroid(lst) for spk, lst in by_spk.items()}
 
     # merge clusters whose centroids are nearly identical — sortformer sometimes
-    # splits one voice into two ids on clean fragments
+    # splits one voice into two ids on clean fragments.
+    # ponytail: only when >2 speakers — on 2-party calls (phone audio) similar
+    # voices get merged into one and the conversation collapses to a single speaker
     root = {s: s for s in centroids}
     def find(x):
         while root[x] != x:
@@ -230,10 +232,11 @@ def assign_speakers(samples, words: list[dict], turns: list[dict], extractor,
     def canon(s):
         return find(s) if s in root else s
     spks = list(centroids)
-    for i, a in enumerate(spks):
-        for b in spks[i + 1:]:
-            if float(centroids[a] @ centroids[b]) >= merge_sim:
-                root[find(b)] = find(a)
+    if len(spks) > 2:
+        for i, a in enumerate(spks):
+            for b in spks[i + 1:]:
+                if float(centroids[a] @ centroids[b]) >= merge_sim:
+                    root[find(b)] = find(a)
     if len({find(s) for s in spks}) < len(spks):
         pooled: dict[str, list] = {}
         for spk, lst in by_spk.items():
@@ -400,7 +403,7 @@ def build_lines(segs: list[dict], min_gap_s: float = 1.0) -> list[dict]:
 
 def fmt_ts(samples: int) -> str:
     s = samples / SR
-    return f"{int(s // 3600):02d}:{int(s // 60) % 60:02d}:{s % 60:05.2f}"
+    return f"{int(s // 3600):02d}:{int(s // 60) % 60:02d}:{int(s % 60):02d}"
 
 
 def main() -> None:
